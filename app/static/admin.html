@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RateGuard Admin</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #ddd; }
+  form { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: flex-end; margin: 1rem 0; }
+  label { display: flex; flex-direction: column; font-size: 0.85rem; gap: 0.25rem; }
+  input { padding: 0.4rem; font-size: 0.9rem; }
+  button { padding: 0.4rem 0.8rem; cursor: pointer; }
+  .error { color: #b00020; font-size: 0.9rem; min-height: 1.2em; }
+  .actions button { margin-right: 0.4rem; }
+</style>
+</head>
+<body>
+  <h1>RateGuard &ndash; Per-Client Limit Overrides</h1>
+
+  <label>
+    Admin Key
+    <input type="password" id="admin-key" placeholder="X-Admin-Key">
+  </label>
+
+  <table id="limits-table">
+    <thead>
+      <tr><th>Client Key</th><th>Rate (tokens/sec)</th><th>Capacity</th><th></th></tr>
+    </thead>
+    <tbody id="limits-body"></tbody>
+  </table>
+
+  <p id="error" class="error"></p>
+
+  <h2>Add / Edit Override</h2>
+  <form id="limit-form">
+    <label>Client Key <input type="text" id="client-key" required></label>
+    <label>Rate <input type="number" id="rate" step="any" min="0" required></label>
+    <label>Capacity <input type="number" id="capacity" step="any" min="0" required></label>
+    <button type="submit">Save</button>
+    <button type="button" id="cancel-edit" hidden>Cancel</button>
+  </form>
+
+<script>
+(function () {
+  var ADMIN_KEY_STORAGE = "rateguard_admin_key";
+  var adminKeyInput = document.getElementById("admin-key");
+  var tableBody = document.getElementById("limits-body");
+  var form = document.getElementById("limit-form");
+  var clientKeyInput = document.getElementById("client-key");
+  var rateInput = document.getElementById("rate");
+  var capacityInput = document.getElementById("capacity");
+  var cancelBtn = document.getElementById("cancel-edit");
+  var errorEl = document.getElementById("error");
+
+  try {
+    var saved = localStorage.getItem(ADMIN_KEY_STORAGE);
+    if (saved) adminKeyInput.value = saved;
+  } catch (e) {}
+
+  adminKeyInput.addEventListener("change", function () {
+    try { localStorage.setItem(ADMIN_KEY_STORAGE, adminKeyInput.value); } catch (e) {}
+  });
+
+  function showError(message) {
+    errorEl.textContent = message || "";
+  }
+
+  function headers(extra) {
+    var base = { "X-Admin-Key": adminKeyInput.value };
+    if (extra) {
+      for (var k in extra) base[k] = extra[k];
+    }
+    return base;
+  }
+
+  function loadLimits() {
+    showError("");
+    fetch("/admin/limits", { headers: headers() })
+      .then(function (res) {
+        if (res.status === 401) {
+          showError("Unauthorized - check the admin key");
+          tableBody.innerHTML = "";
+          return null;
+        }
+        if (!res.ok) {
+          showError("Failed to load overrides (" + res.status + ")");
+          return null;
+        }
+        return res.json();
+      })
+      .then(function (data) {
+        if (data) renderTable(data);
+      })
+      .catch(function () {
+        showError("Network error loading overrides");
+      });
+  }
+
+  function renderTable(overrides) {
+    tableBody.innerHTML = "";
+    var keys = Object.keys(overrides).sort();
+    if (keys.length === 0) {
+      var emptyRow = document.createElement("tr");
+      var emptyCell = document.createElement("td");
+      emptyCell.colSpan = 4;
+      emptyCell.innerHTML = "<em>No overrides configured</em>";
+      emptyRow.appendChild(emptyCell);
+      tableBody.appendChild(emptyRow);
+      return;
+    }
+    keys.forEach(function (clientKey) {
+      var override = overrides[clientKey];
+      var row = document.createElement("tr");
+
+      var keyCell = document.createElement("td");
+      keyCell.textContent = clientKey;
+
+      var rateCell = document.createElement("td");
+      rateCell.textContent = override.rate;
+
+      var capacityCell = document.createElement("td");
+      capacityCell.textContent = override.capacity;
+
+      var actionsCell = document.createElement("td");
+      actionsCell.className = "actions";
+
+      var editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.textContent = "Edit";
+      editBtn.addEventListener("click", function () {
+        startEdit(clientKey, override);
+      });
+
+      var deleteBtn = document.createElement("button");
+      deleteBtn.type = "button";
+      deleteBtn.textContent = "Delete";
+      deleteBtn.addEventListener("click", function () {
+        deleteLimit(clientKey);
+      });
+
+      actionsCell.appendChild(editBtn);
+      actionsCell.appendChild(deleteBtn);
+
+      row.appendChild(keyCell);
+      row.appendChild(rateCell);
+      row.appendChild(capacityCell);
+      row.appendChild(actionsCell);
+      tableBody.appendChild(row);
+    });
+  }
+
+  function startEdit(clientKey, override) {
+    clientKeyInput.value = clientKey;
+    clientKeyInput.disabled = true;
+    rateInput.value = override.rate;
+    capacityInput.value = override.capacity;
+    cancelBtn.hidden = false;
+  }
+
+  function resetForm() {
+    form.reset();
+    clientKeyInput.disabled = false;
+    cancelBtn.hidden = true;
+  }
+
+  cancelBtn.addEventListener("click", resetForm);
+
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    showError("");
+    var clientKey = clientKeyInput.value.trim();
+    if (!clientKey) return;
+
+    fetch("/admin/limits/" + encodeURIComponent(clientKey), {
+      method: "POST",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        rate: parseFloat(rateInput.value),
+        capacity: parseFloat(capacityInput.value)
+      })
+    })
+      .then(function (res) {
+        if (res.status === 401) {
+          showError("Unauthorized - check the admin key");
+          return null;
+        }
+        if (!res.ok) {
+          return res.json().catch(function () { return {}; }).then(function (body) {
+            showError(body.detail || "Failed to save override (" + res.status + ")");
+            return null;
+          });
+        }
+        return true;
+      })
+      .then(function (ok) {
+        if (ok) {
+          resetForm();
+          loadLimits();
+        }
+      })
+      .catch(function () {
+        showError("Network error saving override");
+      });
+  });
+
+  function deleteLimit(clientKey) {
+    showError("");
+    fetch("/admin/limits/" + encodeURIComponent(clientKey), {
+      method: "DELETE",
+      headers: headers()
+    })
+      .then(function (res) {
+        if (res.status === 401) {
+          showError("Unauthorized - check the admin key");
+          return;
+        }
+        if (!res.ok && res.status !== 404) {
+          showError("Failed to delete override (" + res.status + ")");
+          return;
+        }
+        loadLimits();
+      })
+      .catch(function () {
+        showError("Network error deleting override");
+      });
+  }
+
+  loadLimits();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,88 @@
+{
+  "uid": "rateguard-overview",
+  "title": "RateGuard Overview",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "tags": ["rateguard"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Allow vs Deny Rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+          "expr": "sum(rate(rateguard_rate_limit_decisions_total{decision=\"allowed\"}[1m]))",
+          "legendFormat": "allowed"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+          "expr": "sum(rate(rateguard_rate_limit_decisions_total{decision=\"denied\"}[1m]))",
+          "legendFormat": "denied"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Total Request Rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+          "expr": "sum(rate(rateguard_request_duration_seconds_count[1m]))",
+          "legendFormat": "requests/sec"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Latency Percentiles (p50 / p95 / p99)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+          "expr": "histogram_quantile(0.50, sum(rate(rateguard_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(rateguard_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+          "expr": "histogram_quantile(0.99, sum(rate(rateguard_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    }
+  ]
+}
