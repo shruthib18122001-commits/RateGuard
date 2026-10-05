@@ -93,7 +93,9 @@ Or headless: `locust -f locustfile.py --host http://localhost:8000 --headless -u
 ## Metrics
 `GET /metrics` exposes Prometheus text-format metrics:
 - `rateguard_rate_limit_decisions_total{decision="allowed"|"denied"}`
-- `rateguard_request_duration_seconds{path="/health"|"/data"}`
+- `rateguard_request_duration_seconds{path="/health"|"/data"|"unmatched"}` — `path` is the
+  matched route, and URLs that hit no route share one `unmatched` value, so scanners
+  can't inflate the number of series
 - `rateguard_breaker_state` — 0=closed, 1=open, 2=half_open
 - `rateguard_breaker_transitions_total{from_state, to_state}`
 - `rateguard_breaker_fallbacks_total{policy="FAIL_OPEN"|"FAIL_CLOSED"}`
@@ -166,6 +168,9 @@ CLOSED ──(N consecutive failures)──▶ OPEN ──(reset timeout)──�
   becomes the single trial request while everyone else stays on the
   fallback. If the trial succeeds the breaker closes. If it fails the
   breaker re-opens and the timeout starts again.
+- Each call reports its outcome against the state it was admitted under. A slow
+  call that finishes after the breaker has opened (or re-opened) is ignored, so
+  only the half-open trial can close or re-open it.
 - These count as failures: any `redis.RedisError` (connection errors,
   timeouts, …), `asyncio.TimeoutError` and `OSError`. Other exceptions only
   release the half-open trial slot and leave the breaker's state unchanged.
