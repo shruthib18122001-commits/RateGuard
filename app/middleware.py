@@ -4,6 +4,8 @@ import os
 import time
 
 from fastapi import Request
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 import redis.asyncio as aioredis
@@ -18,6 +20,8 @@ from app.metrics import (
 )
 
 logger = logging.getLogger(__name__)
+# No-op unless app.tracing.setup_tracing() installed a real provider.
+tracer = trace.get_tracer(__name__)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 RATE_LIMIT_RATE = int(os.environ.get("RATE_LIMIT_RATE", "5"))
@@ -82,16 +86,30 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             key = "anonymous"
 
         start = time.perf_counter()
-        try:
-            allowed, remaining = await breaker.call(limiter.allow, key)
-        except CircuitOpenError:
-            REQUEST_LATENCY.labels(path=request.url.path).observe(time.perf_counter() - start)
-            return await self._fallback(request, call_next)
-        except BREAKER_FAILURES as exc:
-            REQUEST_LATENCY.labels(path=request.url.path).observe(time.perf_counter() - start)
-            logger.warning("Redis rate-limit check failed (%s): %s", type(exc).__name__, exc)
-            return await self._fallback(request, call_next)
+        with tracer.start_as_current_span("rateguard.rate_limit_decision") as span:
+            span.set_attribute("client_key", key)
+            try:
+                allowed, remaining = await breaker.call(limiter.allow, key)
+                fallback = False
+            except CircuitOpenError:
+                fallback = True
+            except BREAKER_FAILURES as exc:
+                logger.warning("Redis rate-limit check failed (%s): %s", type(exc).__name__, exc)
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, "Redis unavailable"))
+                fallback = True
+
+            span.set_attribute("breaker_state", breaker.state.value)
+            if fallback:
+                span.set_attribute("fallback_policy", FALLBACK_POLICY)
+                span.set_attribute("allowed", FALLBACK_POLICY == FAIL_OPEN)
+            else:
+                span.set_attribute("allowed", allowed)
+                span.set_attribute("tokens_remaining", remaining)
         REQUEST_LATENCY.labels(path=request.url.path).observe(time.perf_counter() - start)
+
+        if fallback:
+            return await self._fallback(request, call_next)
 
         if not allowed:
             RATE_LIMIT_DECISIONS.labels(decision="denied").inc()

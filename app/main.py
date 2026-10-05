@@ -6,6 +6,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.admin import router as admin_router
 from app.middleware import RateLimitMiddleware
+from app.tracing import setup_tracing
 
 app = FastAPI(title="RateGuard")
 
@@ -13,6 +14,9 @@ app = FastAPI(title="RateGuard")
 app.add_middleware(RateLimitMiddleware)
 
 app.include_router(admin_router)
+
+# No-op unless OTEL_TRACING_ENABLED is set.
+setup_tracing(app)
 
 _ADMIN_PAGE = Path(__file__).parent / "static" / "admin.html"
 
