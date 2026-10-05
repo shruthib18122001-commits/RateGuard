@@ -48,8 +48,13 @@ def setup_tracing(app):
         trace.set_tracer_provider(provider)
 
         # Prometheus scrapes /metrics every few seconds; tracing those would
-        # just bury the interesting traces.
-        FastAPIInstrumentor.instrument_app(app, tracer_provider=provider, excluded_urls="metrics")
+        # just bury the interesting traces. The pattern is re.search()ed
+        # against the full URL (scheme://host/path?query), so it must be
+        # anchored: a bare "metrics" would also silently drop traces for any
+        # host or path that merely contains the word.
+        FastAPIInstrumentor.instrument_app(
+            app, tracer_provider=provider, excluded_urls=r"/metrics(\?.*)?$"
+        )
         RedisInstrumentor().instrument(tracer_provider=provider)
     except Exception:
         logger.exception("Failed to initialise OpenTelemetry tracing; continuing without it")
