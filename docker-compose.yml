@@ -15,8 +15,15 @@ services:
       RATE_LIMIT_RATE: "5"
       RATE_LIMIT_CAPACITY: "10"
       ADMIN_API_KEY: "admin"
+      REDIS_SOCKET_TIMEOUT: "0.5"
+      BREAKER_FAILURE_THRESHOLD: "5"
+      BREAKER_RESET_TIMEOUT: "10"
+      BREAKER_FALLBACK_POLICY: FAIL_OPEN
+      OTEL_TRACING_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317
     depends_on:
       - redis
+      - tempo
 
   prometheus:
     image: prom/prometheus:latest
@@ -39,3 +46,14 @@ services:
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
+      - tempo
+
+  tempo:
+    # Pinned: Tempo 3.x changed the deployment model/config format.
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./monitoring/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+    ports:
+      - "3200:3200"   # Tempo HTTP API (queried by Grafana)
+      - "4317:4317"   # OTLP gRPC (lets a locally run uvicorn export too)
