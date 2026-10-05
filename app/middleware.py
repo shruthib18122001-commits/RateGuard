@@ -8,6 +8,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+from starlette.routing import Match
 import redis.asyncio as aioredis
 
 from app.circuit_breaker import (
@@ -69,6 +70,18 @@ breaker = CircuitBreaker.from_env(on_transition=_record_breaker_transition)
 BREAKER_STATE.set(STATE_VALUES[breaker.state])
 
 
+def _path_label(request: Request) -> str:
+    """Bounded value for the `path` metric label: the matched route's own
+    path, or "unmatched" when the URL hits no route. Labelling by the raw URL
+    path would mint a new time series for every distinct 404 URL a client (or
+    scanner) invents."""
+    for route in request.app.router.routes:
+        match, _ = route.matches(request.scope)
+        if match is not Match.NONE:
+            return getattr(route, "path", "unmatched")
+    return "unmatched"
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Don't let scraping /metrics, or using the admin API/page, consume a
@@ -106,7 +119,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             else:
                 span.set_attribute("allowed", allowed)
                 span.set_attribute("tokens_remaining", remaining)
-        REQUEST_LATENCY.labels(path=request.url.path).observe(time.perf_counter() - start)
+        REQUEST_LATENCY.labels(path=_path_label(request)).observe(time.perf_counter() - start)
 
         if fallback:
             return await self._fallback(request, call_next)
