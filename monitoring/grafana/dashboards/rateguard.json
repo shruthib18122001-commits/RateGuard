@@ -83,6 +83,66 @@
           "legendFormat": "p99"
         }
       ]
+    },
+    {
+      "id": 4,
+      "title": "Redis Circuit Breaker State",
+      "type": "state-timeline",
+      "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "options": { "showValue": "auto", "mergeValues": true, "rowHeight": 0.9 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 2,
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "closed", "color": "green", "index": 0 },
+                "1": { "text": "open", "color": "red", "index": 1 },
+                "2": { "text": "half_open", "color": "yellow", "index": 2 }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+          "expr": "max(rateguard_breaker_state)",
+          "legendFormat": "breaker"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Breaker Transitions & Fallbacks (per minute)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+          "expr": "sum by (from_state, to_state) (increase(rateguard_breaker_transitions_total[1m]))",
+          "legendFormat": "{{from_state}} → {{to_state}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "rateguard-prometheus" },
+          "expr": "sum by (policy) (increase(rateguard_breaker_fallbacks_total[1m]))",
+          "legendFormat": "fallback ({{policy}})"
+        }
+      ]
     }
   ]
 }

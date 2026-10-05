@@ -8,9 +8,14 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 import redis.asyncio as aioredis
 
-from app.circuit_breaker import BREAKER_FAILURES, CircuitBreaker, CircuitOpenError
+from app.circuit_breaker import (
+    BREAKER_FAILURES, STATE_VALUES, BreakerState, CircuitBreaker, CircuitOpenError,
+)
 from app.limiter import RedisTokenBucketLimiter
-from app.metrics import RATE_LIMIT_DECISIONS, REQUEST_LATENCY
+from app.metrics import (
+    BREAKER_FALLBACKS, BREAKER_STATE, BREAKER_TRANSITIONS, RATE_LIMIT_DECISIONS,
+    REQUEST_LATENCY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +52,17 @@ limiter = RedisTokenBucketLimiter(
     capacity=RATE_LIMIT_CAPACITY,
 )
 
+
+
+def _record_breaker_transition(from_state: BreakerState, to_state: BreakerState):
+    BREAKER_STATE.set(STATE_VALUES[to_state])
+    BREAKER_TRANSITIONS.labels(from_state=from_state.value, to_state=to_state.value).inc()
+    logger.warning("Redis circuit breaker %s -> %s", from_state.value, to_state.value)
+
+
 # Guards every Redis call the middleware makes.
-breaker = CircuitBreaker.from_env()
+breaker = CircuitBreaker.from_env(on_transition=_record_breaker_transition)
+BREAKER_STATE.set(STATE_VALUES[breaker.state])
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -96,6 +110,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return response
 
     async def _fallback(self, request: Request, call_next):
+        BREAKER_FALLBACKS.labels(policy=FALLBACK_POLICY).inc()
         if FALLBACK_POLICY == FAIL_CLOSED:
             return JSONResponse(
                 status_code=503,
