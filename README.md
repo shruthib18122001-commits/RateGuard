@@ -14,6 +14,10 @@ all endpoints.
 - Prometheus metrics (`/metrics`) for allow/deny counts and request latency
 - Pre-provisioned Prometheus + Grafana stack for visualizing those metrics
 - Per-client rate limit overrides, managed via an admin API/UI (`/admin`)
+- Circuit breaker around Redis with a configurable fail-open / fail-closed
+  fallback, so a Redis outage degrades gracefully instead of hanging requests
+- Distributed tracing with OpenTelemetry, exported to a pre-provisioned
+  Grafana Tempo
 - Environment-agnostic, production-style design
 
 ## Architecture
@@ -46,6 +50,15 @@ Environment variables (all optional, defaults shown):
 | `RATE_LIMIT_RATE`      | `5`                          | Default tokens refilled per second |
 | `RATE_LIMIT_CAPACITY`  | `10`                         | Default bucket capacity (max burst) |
 | `ADMIN_API_KEY`        | *(unset — admin API always 401s)* | Required value of the `X-Admin-Key` header for the admin API |
+| `REDIS_SOCKET_TIMEOUT` | `0.5`                        | Redis connect/read timeout (seconds) |
+| `BREAKER_FAILURE_THRESHOLD` | `5`                     | Consecutive Redis failures that open the breaker |
+| `BREAKER_RESET_TIMEOUT` | `10`                        | Seconds the breaker stays open before a half-open trial |
+| `BREAKER_FALLBACK_POLICY` | `FAIL_OPEN`               | `FAIL_OPEN` (serve unthrottled) or `FAIL_CLOSED` (503) while Redis is unavailable |
+| `OTEL_TRACING_ENABLED` | `false`                      | `true` to enable OpenTelemetry tracing |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint spans are exported to |
+
+See [Circuit Breaker](#circuit-breaker) and
+[Distributed Tracing](#distributed-tracing) for details.
 
 ## Running locally
 ```bash
@@ -61,7 +74,7 @@ uvicorn app.main:app --reload
 ```bash
 docker compose up --build
 ```
-Starts the app (port 8000), Redis, Prometheus, and Grafana together.
+Starts the app (port 8000), Redis, Prometheus, Grafana and Tempo together.
 
 ## Tests
 ```bash
@@ -81,6 +94,9 @@ Or headless: `locust -f locustfile.py --host http://localhost:8000 --headless -u
 `GET /metrics` exposes Prometheus text-format metrics:
 - `rateguard_rate_limit_decisions_total{decision="allowed"|"denied"}`
 - `rateguard_request_duration_seconds{path="/health"|"/data"}`
+- `rateguard_breaker_state` — 0=closed, 1=open, 2=half_open
+- `rateguard_breaker_transitions_total{from_state, to_state}`
+- `rateguard_breaker_fallbacks_total{policy="FAIL_OPEN"|"FAIL_CLOSED"}`
 
 ## Dashboards
 ```bash
@@ -95,6 +111,8 @@ shows:
 - Total request rate
 - p50/p95/p99 request latency (`histogram_quantile` over
   `rateguard_request_duration_seconds`)
+- Redis circuit breaker state over time (closed / open / half_open)
+- Breaker transitions and fallback-handled requests per minute
 
 Prometheus itself is reachable at [http://localhost:9090](http://localhost:9090)
 and scrapes the app's `/metrics` every 5 seconds (config in
@@ -125,3 +143,149 @@ curl http://localhost:8000/admin/limits -H "X-Admin-Key: $ADMIN_API_KEY"
 curl -X DELETE http://localhost:8000/admin/limits/some-client-key \
   -H "X-Admin-Key: $ADMIN_API_KEY"
 ```
+
+## Circuit Breaker
+If Redis goes down or hangs, every rate-limit check would otherwise wait
+for a timeout and then fail. A circuit breaker
+([`app/circuit_breaker.py`](app/circuit_breaker.py)) wraps every Redis
+call the middleware makes, so a Redis outage costs a few failed calls and
+nothing more.
+
+### Design
+```
+CLOSED ──(N consecutive failures)──▶ OPEN ──(reset timeout)──▶ HALF_OPEN
+  ▲                                   ▲                            │
+  │                                   └──────(trial fails)─────────┤
+  └──────────────────────(trial succeeds)──────────────────────────┘
+```
+- **closed**: calls go through. Any success resets the failure count. After
+  `BREAKER_FAILURE_THRESHOLD` *consecutive* failures, the breaker opens.
+- **open**: calls are short-circuited straight to the fallback policy. There
+  is no Redis round trip and no socket timeout to wait out.
+- **half_open**: after `BREAKER_RESET_TIMEOUT` seconds, the next request
+  becomes the single trial request while everyone else stays on the
+  fallback. If the trial succeeds the breaker closes. If it fails the
+  breaker re-opens and the timeout starts again.
+- These count as failures: any `redis.RedisError` (connection errors,
+  timeouts, …), `asyncio.TimeoutError` and `OSError`. Other exceptions only
+  release the half-open trial slot and leave the breaker's state unchanged.
+- The Redis client uses a short connect/read timeout
+  (`REDIS_SOCKET_TIMEOUT`, default 0.5s). A hung Redis therefore costs at
+  most that long per request until the breaker opens.
+- The breaker is thread-safe: a lock guards all of its state. The move from
+  open to half_open happens on the first check after the timeout, so no
+  background timer is needed. Each app process has its own breaker.
+
+### Fallback policy
+`BREAKER_FALLBACK_POLICY` decides what happens when Redis can't give an
+answer, either because the breaker is open or because the call just failed:
+
+| Policy | Behaviour |
+|---|---|
+| `FAIL_OPEN` *(default)* | Requests are served **without rate limiting**. The response carries `X-RateGuard-Fallback: fail-open` and no `X-RateLimit-*` headers. |
+| `FAIL_CLOSED` | Requests are rejected with **503** and a `Retry-After` header set to the reset timeout:<br>`{"detail": "Rate limiter unavailable; request rejected (fail-closed policy)", "error": "rate_limiter_unavailable", "breaker_state": "open"}` |
+
+Fail-open favours availability: a Redis outage doesn't take the API down
+with it. Fail-closed favours protection: use it when the limit guards
+something that must never be overloaded.
+
+`/metrics` and `/admin*` don't go through the limiter, so the breaker
+doesn't affect them. The admin API itself talks to Redis directly and
+returns errors while Redis is down.
+
+### Metrics
+`rateguard_breaker_state` (gauge),
+`rateguard_breaker_transitions_total{from_state,to_state}` and
+`rateguard_breaker_fallbacks_total{policy}`. Two panels on the Grafana
+dashboard show them: **Redis Circuit Breaker State** and **Breaker
+Transitions & Fallbacks**. Every transition is also logged at WARNING
+level.
+
+## Distributed Tracing
+RateGuard uses OpenTelemetry ([`app/tracing.py`](app/tracing.py)) to
+trace each request. A trace looks like this:
+
+```
+GET /data                              (FastAPI auto-instrumentation)
+└── rateguard.rate_limit_decision      (custom span)
+    └── EVALSHA                        (Redis auto-instrumentation)
+```
+
+The `rateguard.rate_limit_decision` span carries these attributes:
+
+| Attribute | Meaning |
+|---|---|
+| `client_key` | The `X-API-Key` / client IP the bucket is keyed on |
+| `allowed` | Whether the request was let through (`true` for fail-open fallbacks) |
+| `tokens_remaining` | Tokens left in the bucket (absent when Redis was unavailable) |
+| `breaker_state` | `closed` / `open` / `half_open` after the decision |
+| `fallback_policy` | Set only when the fallback policy handled the request |
+
+If the Redis call fails, the span also records the exception and has
+error status.
+
+- `service.name` is `rateguard`. Spans are batched and exported over OTLP
+  gRPC to `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- Tracing is **off by default** (`OTEL_TRACING_ENABLED=true` turns it on).
+  When it's off, the custom span is a no-op from the OpenTelemetry API.
+- `/metrics` is excluded from tracing, so Prometheus scrapes don't bury
+  the interesting traces.
+- **Tempo being down never breaks the app.** Export runs on a background
+  thread, so an unreachable endpoint only logs warnings and drops spans.
+  Any error during tracing setup is logged and the app runs untraced.
+- `client_key` is recorded verbatim. If API keys are secrets in your
+  deployment, hash them before putting them on spans.
+
+In Docker Compose, tracing is enabled and points at the `tempo` service.
+Grafana Tempo (single binary, local storage, config in
+`monitoring/tempo/tempo.yaml`) is provisioned as a Grafana data source next
+to Prometheus. Tempo's OTLP port `4317` is also published, so a
+`uvicorn` running on the host can export to it with
+`OTEL_TRACING_ENABLED=true`.
+
+## Demo: Redis outage end to end
+```bash
+# 1. Start everything (app, Redis, Prometheus, Grafana, Tempo)
+docker compose up -d --build
+
+# 2. Generate steady load in a second terminal
+locust -f locustfile.py --host http://localhost:8000 --headless -u 20 -r 5 -t 5m
+
+# 3. Open the dashboard: http://localhost:3000/d/rateguard-overview
+#    The breaker panel shows "closed" and requests are a mix of allowed and denied.
+
+# 4. Kill Redis
+docker compose stop redis
+```
+- Within one scrape interval (5s), **Redis Circuit Breaker State** turns
+  red ("open"). **Breaker Transitions & Fallbacks** shows a
+  `closed → open` bar, then a steady `fallback (FAIL_OPEN)` rate. Locust
+  keeps getting 200s, because requests are served unthrottled.
+- Every 10s you'll see `open → half_open → open` as the trial request
+  fails against the dead Redis.
+- `curl -i localhost:8000/data` returns `X-RateGuard-Fallback: fail-open`.
+
+```bash
+# 5. Bring Redis back
+docker compose start redis
+```
+- Within about 10s, the next trial succeeds. You'll see `half_open → closed`,
+  the panel goes back to green, and 429s come back.
+
+**Inspect traces in Tempo:** in Grafana, go to **Explore → Tempo** and
+choose **Search**, or use **TraceQL** with one of these queries:
+- `{resource.service.name="rateguard"}` for all traces
+- `{span.breaker_state="open"}` for requests served while the breaker was
+  open
+- `{span.allowed=false}` for rate-limited (429) requests
+- `{status=error}` for decisions where the Redis call itself failed
+
+Open a trace to see the decision span and its attributes, nested under the
+HTTP span. While Redis is up, the `EVALSHA` span sits under the decision
+span.
+
+**Try fail-closed:** set `BREAKER_FALLBACK_POLICY: FAIL_CLOSED` under
+the `app` service in `docker-compose.yml`, then run
+`docker compose up -d app` and repeat step 4. Requests now get
+`503 {"error": "rate_limiter_unavailable", ...}`, and the fallback series
+shows `FAIL_CLOSED`.
