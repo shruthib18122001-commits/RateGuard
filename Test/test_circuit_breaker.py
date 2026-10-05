@@ -175,3 +175,72 @@ def test_concurrent_half_open_trials_only_one_admitted():
     for t in threads:
         t.join()
     assert results.count(True) == 1
+
+
+def test_straggler_success_does_not_close_an_open_breaker():
+    """A call admitted while closed that only finishes after the breaker has
+    opened must not close it: that would skip the reset timeout and the
+    half_open trial entirely."""
+    breaker, _ = _breaker(threshold=1)
+
+    async def scenario():
+        release = asyncio.Event()
+
+        async def slow_ok():
+            await release.wait()
+            return "late"
+
+        straggler = asyncio.create_task(breaker.call(slow_ok))
+        await asyncio.sleep(0)  # let it get admitted
+        with pytest.raises(redis.ConnectionError):
+            await breaker.call(_fail)  # trips the breaker
+        assert breaker.state is BreakerState.OPEN
+
+        release.set()
+        assert await straggler == "late"
+        assert breaker.state is BreakerState.OPEN
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("straggler_fails", [False, True])
+def test_straggler_outcome_does_not_decide_the_half_open_trial(straggler_fails):
+    """Only the trial request's own outcome may close or re-open the breaker
+    in half_open, not a slow call that was admitted back when it was closed."""
+    breaker, clock = _breaker(threshold=1, timeout=10)
+
+    async def scenario():
+        release_straggler = asyncio.Event()
+        release_trial = asyncio.Event()
+
+        async def straggler_call():
+            await release_straggler.wait()
+            if straggler_fails:
+                raise redis.ConnectionError("late failure")
+
+        async def trial_call():
+            await release_trial.wait()
+            return "trial ok"
+
+        straggler = asyncio.create_task(breaker.call(straggler_call))  # admitted while closed
+        await asyncio.sleep(0)
+        with pytest.raises(redis.ConnectionError):
+            await breaker.call(_fail)  # opens the breaker
+        clock.advance(10)
+        trial = asyncio.create_task(breaker.call(trial_call))  # the half_open trial
+        await asyncio.sleep(0)
+        assert breaker.state is BreakerState.HALF_OPEN
+
+        release_straggler.set()
+        if straggler_fails:
+            with pytest.raises(redis.ConnectionError):
+                await straggler
+        else:
+            await straggler
+        assert breaker.state is BreakerState.HALF_OPEN  # trial is still pending
+
+        release_trial.set()
+        assert await trial == "trial ok"
+        assert breaker.state is BreakerState.CLOSED
+
+    asyncio.run(scenario())

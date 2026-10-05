@@ -65,6 +65,11 @@ class CircuitBreaker:
         self._failures = 0
         self._opened_at = 0.0
         self._trial_in_flight = False
+        # Bumped on every state change. A call remembers the generation it
+        # was admitted under, so a slow call that finishes after the breaker
+        # has since opened (or re-opened) can't close it or re-open it, and
+        # only the half_open trial's own outcome decides that state.
+        self._generation = 0
 
     @classmethod
     def from_env(cls, **kwargs):
@@ -89,6 +94,7 @@ class CircuitBreaker:
         if from_state is to_state:
             return
         self._state = to_state
+        self._generation += 1
         if to_state is BreakerState.OPEN:
             self._opened_at = self._clock()
         if to_state is not BreakerState.HALF_OPEN:
@@ -100,26 +106,39 @@ class CircuitBreaker:
         """Return True if the caller may hit the dependency now. A True in
         half_open claims the single trial slot; the caller must then report
         the outcome via record_success()/record_failure()/release()."""
+        return self._admit() is not None
+
+    def _admit(self):
+        """Like allow_request(), but returns the generation the caller was
+        admitted under (to pass back with its outcome), or None if rejected."""
         with self._lock:
             if self._state is BreakerState.CLOSED:
-                return True
+                return self._generation
             if self._state is BreakerState.OPEN:
                 if self._clock() - self._opened_at < self.reset_timeout:
-                    return False
+                    return None
                 self._transition(BreakerState.HALF_OPEN)
             # half_open: only one trial at a time.
             if self._trial_in_flight:
-                return False
+                return None
             self._trial_in_flight = True
-            return True
+            return self._generation
 
-    def record_success(self):
+    def record_success(self, generation=None):
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return  # admitted under an earlier state; says nothing about now
+            if self._state is BreakerState.OPEN:
+                # Only the half_open trial may close the breaker, never a
+                # straggler that finished after it opened.
+                return
             self._failures = 0
             self._transition(BreakerState.CLOSED)
 
-    def record_failure(self):
+    def record_failure(self, generation=None):
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return
             if self._state is BreakerState.HALF_OPEN:
                 self._transition(BreakerState.OPEN)
                 return
@@ -131,11 +150,13 @@ class CircuitBreaker:
             if self._failures >= self.failure_threshold:
                 self._transition(BreakerState.OPEN)
 
-    def release(self):
+    def release(self, generation=None):
         """Give back a half_open trial slot without judging Redis health,
         e.g. when the trial was cancelled or failed for an unrelated reason.
         Without this a cancelled trial would wedge the breaker in half_open."""
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return  # not the trial's slot; leave the real trial alone
             self._trial_in_flight = False
 
     async def call(self, func, *args, **kwargs):
@@ -143,15 +164,16 @@ class CircuitBreaker:
 
         Raises CircuitOpenError if short-circuited; re-raises the original
         exception (after recording it) if the call itself fails."""
-        if not self.allow_request():
+        generation = self._admit()
+        if generation is None:
             raise CircuitOpenError(f"circuit breaker is {self.state.value}")
         try:
             result = await func(*args, **kwargs)
         except BREAKER_FAILURES:
-            self.record_failure()
+            self.record_failure(generation)
             raise
         except BaseException:
-            self.release()
+            self.release(generation)
             raise
-        self.record_success()
+        self.record_success(generation)
         return result
